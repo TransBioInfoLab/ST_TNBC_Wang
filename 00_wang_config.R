@@ -17,11 +17,12 @@ CONFIG <- list(
   clinical_file = "Clinical/Clinical.RDS",
   ids_file = "Clinical/ids.RDS",
   classification_file = "classification/classifAll.RDS",
+  heldout_file = "classification/loosReg.RData",
   counts_dir = "Robjects/countsNonCorrected",
   images_dir = "Robjects/images",
   annotation_dir = "Robjects/annotsBySpot",
 
-  working_output_dir = "outputs_wang",
+  working_output_dir = "outputs_wang_v1.1",
 
   # Preprocessing settings
   min_umi = 500,
@@ -39,10 +40,10 @@ CONFIG <- list(
 
   # Marker-score validation
   annotated_spots_file =
-    file.path("outputs_wang", "abundance_validation", "annotated_spots.rds"),
+    file.path("outputs_wang_v1.1", "abundance_validation", "annotated_spots.rds"),
 
   validation_results_dir =
-    file.path("outputs_wang", "abundance_validation"),
+    file.path("outputs_wang_v1.1", "abundance_validation"),
 
   primary_min_spots = 200,
   sensitivity_min_spots = 100,
@@ -50,8 +51,10 @@ CONFIG <- list(
   min_complete_spots_for_rho = 20,
   min_positive_for_auc = 5,
   min_negative_for_auc = 5,
+  
+  min_annotation_biological_pixels = 1000,
 
   # Release/documentation version
-  release_version = "1.0",
+  release_version = "1.1",
   release_date = format(Sys.Date(), "%Y-%m-%d")
 )

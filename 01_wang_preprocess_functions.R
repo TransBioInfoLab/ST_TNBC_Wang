@@ -164,7 +164,9 @@ add_clinical_metadata_safe <- function(obj, clinical_row) {
 }
 
 # load subarray
-extract_wang_subarray <- function(parent, subarray_id){
+extract_wang_subarray <- function(parent, subarray_id, 
+                                  min_annotation_pixels = 1000,
+                                  relapse_to_primary = c("30" = "53", "66" = "58")){
   
   count_obj <- parent$count_obj
   image_obj <- parent$image_obj
@@ -209,32 +211,55 @@ extract_wang_subarray <- function(parent, subarray_id){
   
   # Convert to sparse format.
   counts_gene_spot <- Matrix::Matrix(counts_gene_spot, sparse = TRUE)
-  detected_genes <- Matrix::rowSums(counts_gene_spot > 0) > 0
-  counts_gene_spot <- counts_gene_spot[detected_genes, ,drop = FALSE]
   
+  # Seurat replaces underscores and pipes in feature names.
+  # Record the conversion while preserving expression values.
+  source_genes <- rownames(counts_gene_spot)
+  if (is.null(source_genes) || anyNA(source_genes) ||
+      any(!nzchar(source_genes)) || anyDuplicated(source_genes)) {
+    stop("Source feature names must be present and unique.")
+  }
+  
+  assay_genes <- gsub("[_|]", "-", source_genes)
+  if (anyDuplicated(assay_genes)) {
+    stop("Feature names collide after Seurat name conversion.")
+  }
+  
+  rownames(counts_gene_spot) <- assay_genes
   obj <- Seurat::CreateSeuratObject(
     counts = counts_gene_spot,
     project = subarray_id,
-    min.cells = 1,
+    min.cells = 0,
     min.features = 0,
     meta.data = spot_meta
+  )
+  
+  obj@misc$wang_feature_map <- data.frame(
+    source_gene = source_genes,
+    assay_gene = assay_genes,
+    stringsAsFactors = FALSE
   )
   
   obj$study <- "Wang_2024"
   obj$platform <- "legacy_ST"
   obj$count_id <- count_id
   obj$subarray_id <- subarray_id
+  
+  is_relapse <- count_id %in% names(relapse_to_primary)
+  obj$subject_id <- if (is_relapse) {
+    unname(relapse_to_primary[count_id])
+  } else {count_id}
+  
+  obj$specimen_type <- if (is_relapse) "relapse" else "primary"
+  obj$baseline_primary_specimen <- !is_relapse
+  
   obj$parent_slide <- as.character(id_row$slide)
   obj$subslide <- as.character(id_row$subslide)
   obj$sample_label <- as.character(id_row$ID)
-  obj$has_manual_annotation <-
-    as.logical(id_row$hasAnnot)
+  obj$has_manual_annotation <- as.logical(id_row$hasAnnot)
   
   # Add clinical metadata in scalar-safe form.
-  obj <- add_clinical_metadata_safe(
-    obj = obj,
-    clinical_row = clinical_row
-  )
+  obj <- add_clinical_metadata_safe(obj = obj, clinical_row = clinical_row)
 
   # Add classification scores
   if (!is.null(class_obj)) {
@@ -263,6 +288,10 @@ extract_wang_subarray <- function(parent, subarray_id){
     obj$hist_highest_score_class <- original_names[max.col(score_matrix, ties.method = "first")]
     obj$hist_highest_score_value <- apply(score_matrix, 1, max, na.rm = TRUE)
     obj$hist_score_sum <- rowSums(score_matrix, na.rm = TRUE)
+    # These labels describe the current classifAll.RDS input.
+    obj$hist_prediction_source <- "classifAll.RDS"
+    obj$hist_prediction_type <- "full_data_expression_prediction"
+    obj$hist_prediction_modality <- "RNA"
   }
   
   
@@ -319,16 +348,16 @@ extract_wang_subarray <- function(parent, subarray_id){
       # define excluded annotation categories
       excluded_categories <- c("Nothing", "Hole (whitespace)","Artefacts")
       biological_categories <- setdiff(colnames(annotation_counts), excluded_categories)
+      biological_counts <- annotation_counts[, biological_categories, drop = FALSE]
       
       total_all_pixels <- rowSums(annotation_counts,na.rm = TRUE)
-      total_biological_pixels <- rowSums(
-        annotation_counts[, biological_categories, drop = FALSE],
-        na.rm = TRUE
-      )
+      total_biological_pixels <- rowSums(biological_counts)
       
       # calculate biological fractions
-      biological_counts <- annotation_counts[, biological_categories, drop = FALSE]
-      biological_fraction <- sweep(biological_counts, MARGIN = 1, STATS = pmax(total_biological_pixels, 1), FUN = "/")
+      bio_denominator <- total_biological_pixels
+      bio_denominator[!is.finite(bio_denominator) | bio_denominator <= 0] <- NA_real_
+      
+      biological_fraction <- sweep(biological_counts, 1, bio_denominator, "/")
       
       # Keep the original category names before sanitizing them
       original_annotation_names <- colnames(annotation_counts)
@@ -350,9 +379,12 @@ extract_wang_subarray <- function(parent, subarray_id){
       obj <- Seurat::AddMetaData(object = obj, metadata = annotation_fraction_df)
       
       # calculte QC fractions
-      artifact_fraction <- annotation_counts[, "Artefacts"] / pmax(total_all_pixels, 1)
-      whitespace_fraction <- annotation_counts[, "Hole (whitespace)"] / pmax(total_all_pixels, 1)
-      unannotated_fraction <- annotation_counts[, "Nothing"] / pmax(total_all_pixels, 1)
+      all_denominator <- total_all_pixels
+      all_denominator[!is.finite(all_denominator) | all_denominator <= 0] <- NA_real_
+      
+      artifact_fraction <- annotation_counts[, "Artefacts"] / all_denominator
+      whitespace_fraction <- annotation_counts[, "Hole (whitespace)"] / all_denominator
+      unannotated_fraction <- annotation_counts[, "Nothing"] / all_denominator
       
       obj$manual_artifact_fraction_all_pixels <- artifact_fraction
       obj$manual_whitespace_fraction_all_pixels <- whitespace_fraction
@@ -360,7 +392,7 @@ extract_wang_subarray <- function(parent, subarray_id){
       
       # Dominant manually annotated category
       manual_dominant_class <- rep(NA_character_, nrow(biological_counts))
-      annotated <- total_biological_pixels > 0
+      annotated <- is.finite(total_biological_pixels) & total_biological_pixels > 0
       
       manual_dominant_class[annotated] <-
         colnames(biological_counts)[
@@ -369,7 +401,11 @@ extract_wang_subarray <- function(parent, subarray_id){
       obj$manual_dominant_class <- manual_dominant_class
       obj$manual_all_pixels <- total_all_pixels
       obj$manual_annotated_pixels <- total_biological_pixels
-      obj$manual_has_annotated_pixels <- total_biological_pixels > 0
+      
+      obj$manual_has_annotated_pixels <- annotated
+      obj$manual_annotation_supported <- is.finite(total_biological_pixels) &
+        total_biological_pixels > min_annotation_pixels
+      obj$manual_annotation_min_pixels <- min_annotation_pixels
     }
     
   } else {
@@ -383,6 +419,8 @@ extract_wang_subarray <- function(parent, subarray_id){
     obj$manual_all_pixels <- NA_real_
     obj$manual_annotated_pixels <- NA_real_
     obj$manual_has_annotated_pixels <- FALSE
+    obj$manual_annotation_supported <- FALSE
+    obj$manual_annotation_min_pixels <- min_annotation_pixels
   }
   
   list(
@@ -478,72 +516,225 @@ get_assay_matrix <- function(obj, assay = NULL, layer = "data") {
 
 robust_z <- function(x) {
   x <- as.numeric(x)
-  med <- stats::median(x, na.rm = TRUE)
-  madv <- stats::mad(x, center = med, constant = 1.4826, na.rm = TRUE)
-  if (!is.finite(madv) || madv <= 0) {
-    sdv <- stats::sd(x, na.rm = TRUE)
-    if (!is.finite(sdv) || sdv <= 0) return(rep(0, length(x)))
-    return((x - mean(x, na.rm = TRUE)) / sdv)
-  }
-  (x - med) / madv
-}
-
-nonnegative_scale <- function(x) {
-  # Convert any abundance-like score to a nonnegative field.
-  # This is a robust z-score truncated at zero; it is not a cell proportion.
-  y <- robust_z(x)
-  y[!is.finite(y)] <- 0
-  pmax(y, 0)
-}
-
-calculate_module_coverage <- function(obj, gene_sets, subarray_id, count_id) {
-  data.table::rbindlist(lapply(names(gene_sets), function(nm) {
-    requested <- unique(gene_sets[[nm]])
-    detected <- intersect(requested, rownames(obj))
-    data.frame(
-      count_id = as.character(count_id),
-      subarray_id = as.character(subarray_id),
-      module = nm,
-      n_requested = length(requested),
-      n_detected = length(detected),
-      fraction_detected = if (length(requested) > 0) length(detected) / length(requested) else NA_real_,
-      missing_genes = paste(setdiff(requested, detected), collapse = ";"),
-      stringsAsFactors = FALSE
-    )
-  }), fill = TRUE)
-}
-
-compute_module_scores <- function(obj, gene_sets, assay = NULL, layer = "data") {
-  assay <- assay %||% DefaultAssay(obj)
-  expr <- get_assay_matrix(obj, assay = assay, layer = layer)
-  all_genes <- rownames(expr)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
   
-  meta_add <- list()
+  if (!any(ok)) return(out)
   
-  for (nm in names(gene_sets)) {
-    genes <- intersect(gene_sets[[nm]], all_genes)
-    out_col <- paste0("score_", nm)
+  values <- x[ok]
+  med <- stats::median(values)
+  spread <- stats::mad(values, center = med, constant = 1.4826)
+  
+  if (is.finite(spread) && spread > 0) {
+    out[ok] <- (values - med) / spread
+  } else {
+    spread <- stats::sd(values)
     
-    if (length(genes) == 0) {
-      warning("No genes found for module: ", nm)
-      meta_add[[out_col]] <- rep(NA_real_, ncol(expr))
-    } else if (length(genes) == 1) {
-      meta_add[[out_col]] <- as.numeric(expr[genes, ])
+    out[ok] <- if (is.finite(spread) && spread > 0) {
+      (values - mean(values)) / spread
     } else {
-      meta_add[[out_col]] <- Matrix::colMeans(expr[genes, , drop = FALSE])
+      rep(0, length(values))
     }
   }
   
-  meta_df <- as.data.frame(meta_add)
+  out
+}
+
+nonnegative_scale <- function(x) {
+  pmax(robust_z(x), 0)
+}
+
+wang_gene_alias_groups <- function() {
+  list(
+    NIBAN3 = c("NIBAN3", "FAM129C"),
+    RIPOR2 = c("RIPOR2", "FAM65B"),
+    ACKR3 = c("ACKR3", "CXCR7")
+  )
+}
+
+resolve_wang_genes <- function(requested, feature_map,
+    alias_groups = wang_gene_alias_groups()) {
+  requested <- unique(as.character(requested))
+  
+  if (!length(requested) || anyNA(requested) ||
+      any(!nzchar(requested))) {
+    stop("Each module must contain nonempty gene identifiers.")
+  }
+  
+  if (!all(c("source_gene", "assay_gene") %in% names(feature_map)) ||
+      anyNA(feature_map) ||
+      anyDuplicated(feature_map$source_gene) ||
+      anyDuplicated(feature_map$assay_gene)) {
+    stop("Invalid source-to-assay feature map.")
+  }
+  
+  source_gene <- vapply(requested, function(g) {
+    groups <- alias_groups[vapply(
+      alias_groups, function(a) g %in% a, logical(1)
+    )]
+    
+    candidates <- unique(c(
+      g, unlist(groups, use.names = FALSE)
+    ))
+    
+    hits <- intersect(candidates, feature_map$source_gene)
+    
+    if (length(hits) > 1L) {
+      stop(
+        "Ambiguous mapping for ", g, ": ",
+        paste(hits, collapse = ", ")
+      )
+    }
+    
+    if (length(hits)) hits[[1L]] else NA_character_
+  }, character(1), USE.NAMES = FALSE)
+  
+  assay_gene <- feature_map$assay_gene[
+    match(source_gene, feature_map$source_gene)
+  ]
+  
+  if (anyDuplicated(assay_gene[!is.na(assay_gene)])) {
+    stop(
+      "A module maps multiple requested genes ",
+      "to the same assay feature."
+    )
+  }
+  
+  data.frame(
+    requested_gene = requested,
+    source_gene = source_gene,
+    assay_gene = assay_gene,
+    alias_used = !is.na(source_gene) &
+      requested != source_gene,
+    stringsAsFactors = FALSE
+  )
+}
+
+compute_module_scores <- function(obj, gene_sets, assay = NULL, layer = "data") {
+  assay <- assay %||% SeuratObject::DefaultAssay(obj)
+  expr <- get_assay_matrix(obj, assay = assay, layer = layer)
+  
+  feature_map <- obj@misc$wang_feature_map
+  
+  if (is.null(feature_map) ||
+      !setequal(feature_map$assay_gene, rownames(expr))) {
+    stop(
+      "Rebuild this object with the revised ",
+      "extract_wang_subarray()."
+    )
+  }
+  
+  if (is.null(names(gene_sets)) ||
+      anyNA(names(gene_sets)) ||
+      any(!nzchar(names(gene_sets))) ||
+      anyDuplicated(names(gene_sets))) {
+    stop("gene_sets must have unique, nonempty module names.")
+  }
+  
+  fixed_sets <- lapply(
+    gene_sets, function(g) unique(as.character(g))
+  )
+  
+  meta_add <- list()
+  maps <- list()
+  coverage <- list()
+  
+  for (nm in names(fixed_sets)) {
+    map <- resolve_wang_genes(fixed_sets[[nm]], feature_map)
+    
+    present <- !is.na(map$assay_gene)
+    complete <- all(present)
+    n_requested <- nrow(map)
+    
+    n_detected <- if (any(present)) {
+      sum(Matrix::rowSums(expr[map$assay_gene[present], , drop = FALSE] > 0) > 0)
+    } else {0L}
+    
+    out_col <- paste0("score_", nm)
+    
+    meta_add[[out_col]] <- if (complete) {
+      as.numeric(Matrix::colMeans(expr[map$assay_gene, , drop = FALSE]))
+    } else {
+      warning(
+        "Module ", nm, " unavailable: ",
+        paste(map$requested_gene[!present], collapse = ", ")
+      )
+      rep(NA_real_, ncol(expr))
+    }
+    
+    maps[[nm]] <- data.frame(
+      module = nm, map, stringsAsFactors = FALSE
+    )
+    
+    coverage[[nm]] <- data.frame(
+      module = nm,
+      n_requested = n_requested,
+      n_available = sum(present),
+      fraction_available = mean(present),
+      n_detected = n_detected,
+      fraction_detected = n_detected / n_requested,
+      score_denominator = n_requested,
+      score_eligible = complete,
+      missing_genes = paste(
+        map$requested_gene[!present], collapse = ";"
+      ),
+      alias_mappings = paste(
+        paste0(
+          map$requested_gene[map$alias_used], "->",
+          map$source_gene[map$alias_used]
+        ),
+        collapse = ";"
+      ),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  meta_df <- as.data.frame(meta_add, check.names = FALSE)
   rownames(meta_df) <- colnames(expr)
   
-  # Add robust z-score version for every module score.
-  for (nm in colnames(meta_df)) {
+  for (nm in names(meta_add)) {
     meta_df[[paste0(nm, "_z")]] <- robust_z(meta_df[[nm]])
     meta_df[[paste0(nm, "_pos")]] <- nonnegative_scale(meta_df[[nm]])
   }
   
-  Seurat::AddMetaData(obj, metadata = meta_df)
+  obj <- Seurat::AddMetaData(obj, metadata = meta_df)
+  
+  obj@misc$wang_module_scoring <- list(
+    version = "fixed_full_marker_mean_v1",
+    assay = assay,
+    layer = layer,
+    missing_policy = "NA_if_any_requested_gene_unavailable",
+    gene_sets = fixed_sets,
+    alias_groups = wang_gene_alias_groups(),
+    gene_mapping = as.data.frame(data.table::rbindlist(maps)),
+    coverage = as.data.frame(data.table::rbindlist(coverage))
+  )
+  
+  obj
+}
+
+calculate_module_coverage <- function(obj, gene_sets, subarray_id, count_id) {
+  info <- obj@misc$wang_module_scoring
+  
+  fixed_sets <- lapply(
+    gene_sets, function(g) unique(as.character(g))
+  )
+  
+  if (is.null(info) ||
+      !identical(info$gene_sets, fixed_sets)) {
+    stop(
+      "Run compute_module_scores() first ",
+      "with the same gene_sets."
+    )
+  }
+  
+  data.frame(
+    count_id = as.character(count_id),
+    subarray_id = as.character(subarray_id),
+    info$coverage,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
 }
 
 # Ensure a spot-level table contains exactly one scalar value per spot.
@@ -553,11 +744,7 @@ validate_scalar_spot_table <- function(df, table_name = "spot table") {
 
   bad <- vapply(
     df,
-    function(x) {
-      !is.atomic(x) ||
-        !is.null(dim(x)) ||
-        length(x) != nr
-    },
+    function(x) {!is.atomic(x) || !is.null(dim(x)) || length(x) != nr},
     logical(1)
   )
 

@@ -84,23 +84,31 @@ summarize_wang_qc <- function(obj) {
     )
   }
 
-  xy <- as.matrix(
-    md[, c("x_um", "y_um"), drop = FALSE]
-  )
-
+  xy <- as.matrix(md[, c("x_um", "y_um"), drop = FALSE])
   median_nn_um <- if (nrow(xy) >= 2) {
     nn <- RANN::nn2(xy, xy, k = 2)
     median(nn$nn.dists[, 2], na.rm = TRUE)
   } else {
     NA_real_
   }
+  
+  raw_counts <- get_assay_matrix(obj, assay = "RNA", layer = "counts")
+  n_genes_detected <- sum(Matrix::rowSums(raw_counts > 0) > 0)
 
   data.frame(
+    run_id = as.character(unique(md$run_id)[1]),
     count_id = as.character(unique(md$count_id)[1]),
     subarray_id = as.character(unique(md$subarray_id)[1]),
-
+    subject_id = as.character(unique(md$subject_id)[1]),
+    specimen_type = as.character(unique(md$specimen_type)[1]),
+    baseline_primary_specimen = all(md$baseline_primary_specimen),
+    counts_branch = as.character(unique(md$counts_branch)[1]),
+    module_score_version = as.character(unique(md$module_score_version)[1]),
+    
     n_spots = nrow(md),
-    n_genes = nrow(obj),
+    n_genes = nrow(raw_counts),
+    n_genes_detected = n_genes_detected,
+    n_annotation_supported = sum(md$manual_annotation_supported, na.rm = TRUE),
 
     median_nCount_RNA = median(md$nCount_RNA, na.rm = TRUE),
     q05_nCount_RNA = qfun(md$nCount_RNA, 0.05),
@@ -142,6 +150,12 @@ make_spot_table <- function(obj) {
     "^platform$",
     "^count_id$",
     "^subarray_id$",
+    "^subject_id$",
+    "^specimen_type$",
+    "^baseline_primary_specimen$",
+    "^run_id$",
+    "^counts_branch$",
+    "^module_score_version$",
     "^parent_slide$",
     "^subslide$",
     "^sample_label$",
@@ -195,7 +209,14 @@ make_spot_table <- function(obj) {
   out
 }
 
-append_status <- function(status_row, status_file) {
+append_status <- function(status_row, status_file, run_id) {
+  status_row <- data.frame(
+    run_id = run_id,
+    status_row,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
   data.table::fwrite(
     status_row,
     status_file,
@@ -237,85 +258,95 @@ process_wang_subarray <- function(parent, subarray_id, config, gene_sets) {
     )
   }
 
-  complete_existing <- all(file.exists(required_existing))
-
-  if (!isTRUE(config$overwrite) && complete_existing) {
-    old_spots <- readRDS(spot_rds_file)
-
-    safe_message("Skipping existing subarray: ", subarray_id)
-
-    return(
-      data.frame(
-        timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-        count_id = count_id,
-        subarray_id = subarray_id,
-        success = TRUE,
-        skipped = TRUE,
-        n_spots = nrow(old_spots),
-
-        normalized_expression_file = normalized_rel,
-        spot_table_rds_file = spot_rds_rel,
-
-        spot_table_csv_file =
-          if (isTRUE(config$save_spot_csv)) {spot_csv_rel} else {NA_character_},
-
-        object_file =
-          if (isTRUE(config$save_seurat_rds)) {object_rel} else {NA_character_},
-
-        error = NA_character_,
-        stringsAsFactors = FALSE
-      )
+  details_file <- file.path(config$output_dir, "module_coverage",
+    paste0(subarray_id, "_scoring_details.rds")
+  )
+  
+  if (any(file.exists(c(required_existing, details_file)))) {
+    stop(
+      "Existing outputs found for ", subarray_id,
+      "; use a fresh output directory."
     )
   }
 
-  safe_message(
-    "Processing subarray: ",
-    subarray_id
+  safe_message("Processing subarray: ", subarray_id)
+
+  result <- extract_wang_subarray(
+    parent = parent,
+    subarray_id = subarray_id,
+    min_annotation_pixels = config$min_annotation_biological_pixels
   )
-
-  result <- extract_wang_subarray(parent = parent, subarray_id = subarray_id)
-
+  
   obj <- result$seurat
   obj <- perform_wang_qc(obj, min_umi = config$min_umi,
-    max_artifact_fraction = config$max_artifact_fraction)
+    max_artifact_fraction = config$max_artifact_fraction
+  )
   obj <- add_wang_micron_coordinates(obj, spot_pitch_um = config$spot_pitch_um)
   obj <- normalize_wang_subarray(obj)
-  obj <- compute_module_scores(obj, gene_sets, assay = "RNA", layer = "data")
+  obj <- compute_module_scores(obj, gene_sets,assay = "RNA", layer = "data")
+  
+  obj$run_id <- config$run_id
+  obj$counts_branch <- config$counts_branch
+  obj$module_score_version <- obj@misc$wang_module_scoring$version
+  
   coverage <- calculate_module_coverage(obj, gene_sets, subarray_id, count_id)
-  data.table::fwrite(coverage, coverage_file)
+  coverage$run_id <- config$run_id
+  
   qc <- summarize_wang_qc(obj)
-
-  data.table::fwrite(qc, qc_file)
   spot_table <- make_spot_table(obj)
-
-  saveRDS(spot_table, spot_rds_file,compress = TRUE)
-
-  if (isTRUE(config$save_spot_csv)) {
-    data.table::fwrite(
-      spot_table,
-      spot_csv_file
-    )
-  }
-
-  normalized_expression <- get_assay_matrix(obj, assay = "RNA",layer = "data")
-
+  
+  normalized_expression <- get_assay_matrix(obj, assay = "RNA", layer = "data")
+  
   stopifnot(
     identical(
       colnames(normalized_expression),
       spot_table$spot_id
-    )
+    ),
+    !anyDuplicated(spot_table$spot_id)
   )
-
+  
+  # Preserve mapping details even if Seurat objects are not saved.
+  saveRDS(
+    list(
+      run_id = config$run_id,
+      feature_map = obj@misc$wang_feature_map,
+      module_scoring = obj@misc$wang_module_scoring,
+      source_files = list(
+        counts = normalizePath(
+          file.path(config$counts_dir, paste0("TNBC", count_id, ".RDS")),
+          mustWork = TRUE
+        ),
+        images = normalizePath(
+          file.path(config$images_dir, paste0("TNBC", count_id, ".RDS")),
+          mustWork = TRUE
+        )
+      )
+    ),
+    details_file,
+    compress = TRUE
+  )
+  
+  data.table::fwrite(coverage, coverage_file)
+  data.table::fwrite(qc, qc_file)
+  
+  saveRDS(spot_table, spot_rds_file, compress = TRUE)
+  
+  if (isTRUE(config$save_spot_csv)) {
+    data.table::fwrite(spot_table, spot_csv_file)
+  }
+  
   saveRDS(normalized_expression, normalized_file, compress = TRUE)
-
+  
   if (isTRUE(config$save_seurat_rds)) {
     saveRDS(obj, object_file, compress = TRUE)
   }
-
+  
   n_spots <- ncol(obj)
-
-  rm(obj, result, spot_table, normalized_expression, coverage, qc)
-
+  
+  rm(
+    obj, result, spot_table,
+    normalized_expression, coverage, qc
+  )
   gc(verbose = FALSE)
 
   data.frame(
@@ -345,27 +376,70 @@ process_wang_subarray <- function(parent, subarray_id, config, gene_sets) {
 }
 
 run_wang_full_cohort <- function(config = CONFIG) {
+  used_config_file <- normalizePath(config_file, mustWork = TRUE)
+  
   old_wd <- getwd()
   on.exit(setwd(old_wd), add = TRUE)
-
   setwd(config$project_dir)
-
+  
   config$output_dir <- config$working_output_dir
-
-  make_output_dirs(config$output_dir)
-
-  if (!file.exists(config$function_file)) {
+  
+  if (file.exists(config$output_dir) &&
+      !dir.exists(config$output_dir)) {
+    stop("Output path is an existing file.")
+  }
+  
+  if (dir.exists(config$output_dir) &&
+      length(list.files(
+        config$output_dir,
+        all.files = TRUE,
+        no.. = TRUE
+      ))) {
     stop(
-      "Function file not found: ",
-      config$function_file
+      "Output directory must be empty: ",
+      config$output_dir
     )
   }
-
-  if (!file.exists(config$gene_sets_file)) {
+  
+  threshold <- config$min_annotation_biological_pixels
+  
+  if (!is.numeric(threshold) ||
+      length(threshold) != 1L ||
+      !is.finite(threshold) ||
+      threshold < 0) {
     stop(
-      "Gene-set file not found: ",
-      config$gene_sets_file
+      "Set min_annotation_biological_pixels ",
+      "to one nonnegative number."
     )
+  }
+  
+  config$counts_branch <- basename(
+    normalizePath(config$counts_dir, mustWork = TRUE)
+  )
+  
+  if (config$counts_branch != "countsNonCorrected") {
+    stop(
+      "This runner expects the ",
+      "countsNonCorrected raw-count branch."
+    )
+  }
+  
+  if (is.null(config$run_id)) {
+    config$run_id <- paste0(
+      "wang_", config$release_version, "_",
+      format(
+        Sys.time(), "%Y%m%dT%H%M%S",
+        tz = "UTC"
+      ),
+      "Z"
+    )
+  }
+  
+  if (!is.character(config$run_id) ||
+      length(config$run_id) != 1L ||
+      is.na(config$run_id) ||
+      !nzchar(config$run_id)) {
+    stop("run_id must be one nonempty character value.")
   }
 
   source(config$function_file)
@@ -410,16 +484,139 @@ run_wang_full_cohort <- function(config = CONFIG) {
     parent_ids <- parent_ids[as.numeric(parent_ids) <= as.numeric(config$stop_parent)]
   }
 
-  status_file <- file.path(config$output_dir, "status", "subarray_processing_status.csv")
-
-  if (isTRUE(config$overwrite) && file.exists(status_file)) {
-    file.remove(status_file)
+  if (!length(parent_ids)) {stop("No specimens selected.")}
+  
+  if (anyDuplicated(rownames(ids)) || anyNA(ids$id)) {
+    stop("Invalid specimen/subarray identifiers.")
   }
+  
+  annotation_ids <- unique(as.character(
+    ids$id[ids$hasAnnot %in% TRUE & as.character(ids$id) %in% parent_ids]
+  ))
+  
+  if (length(annotation_ids) && is.null(config$annotation_dir)) {
+    stop("annotation_dir is required for annotated specimens.")
+  }
+  
+  code_files <- c(
+    config = used_config_file,
+    runner = file.path(config$project_dir, "02_run_wang_full_cohort.R"),
+    helpers = config$function_file,
+    gene_sets = config$gene_sets_file
+  )
+  
+  annotation_files <- if (length(annotation_ids)) {
+    setNames(
+      file.path(
+        config$annotation_dir,
+        paste0("TNBC", annotation_ids, ".RDS")
+      ),
+      paste0("annotation_", annotation_ids)
+    )
+  } else {
+    character()
+  }
+  
+  input_files <- c(
+    code_files,
+    clinical = config$clinical_file,
+    ids = config$ids_file,
+    classification = config$classification_file,
+    setNames(
+      file.path(
+        config$counts_dir,
+        paste0("TNBC", parent_ids, ".RDS")
+      ),
+      paste0("counts_", parent_ids)
+    ),
+    setNames(
+      file.path(
+        config$images_dir,
+        paste0("TNBC", parent_ids, ".RDS")
+      ),
+      paste0("images_", parent_ids)
+    ),
+    annotation_files
+  )
+  
+  if (any(!file.exists(input_files))) {
+    stop(
+      "Missing inputs: ",
+      paste(input_files[!file.exists(input_files)], collapse = ", ")
+    )
+  }
+  
+  input_manifest <- data.frame(
+    run_id = config$run_id,
+    input = names(input_files),
+    path = normalizePath(unname(input_files), mustWork = TRUE),
+    md5 = unname(tools::md5sum(input_files)),
+    stringsAsFactors = FALSE
+  )
+  
+  if (anyNA(input_manifest$md5)) {
+    stop("Could not checksum every input.")
+  }
+  
+  make_output_dirs(config$output_dir)
+  
+  logs_dir <- file.path(config$output_dir, "logs")
+  code_dir <- file.path(logs_dir, "source_code")
+  dir.create(code_dir, showWarnings = FALSE)
+  
+  if (!all(file.copy(
+    code_files,
+    file.path(code_dir, paste0(names(code_files), ".R")),
+    overwrite = FALSE
+  ))) {
+    stop("Could not save all source-code snapshots.")
+  }
+  
+  config$git_commit <- NA_character_
+  git <- Sys.which("git")
+  
+  if (nzchar(git)) {
+    commit <- tryCatch(
+      suppressWarnings(system2(
+        git,
+        c("-C", shQuote(config$project_dir), "rev-parse", "HEAD"),
+        stdout = TRUE,
+        stderr = FALSE
+      )),
+      error = function(e) character()
+    )
+    
+    if (length(commit) == 1L && is.null(attr(commit, "status"))) {
+      config$git_commit <- commit[[1L]]
+    }
+  }
+  
+  saveRDS(config, file.path(logs_dir, "processing_config.rds"))
+  saveRDS(
+    list(gene_sets = GENE_SETS, alias_groups = wang_gene_alias_groups()),
+    file.path(logs_dir, "scoring_definitions.rds")
+  )
+  
+  data.table::fwrite(
+    input_manifest,
+    file.path(logs_dir, "processing_input_manifest.csv")
+  )
+  
+  capture.output(
+    sessionInfo(),
+    file = file.path(
+      logs_dir, "processing_session_info.txt"
+    )
+  )
+  
+  status_file <- file.path(
+    config$output_dir,
+    "status",
+    "subarray_processing_status.csv"
+  )
 
   for (count_id in parent_ids) {
-    safe_message(
-      "Loading parent count ID: ", count_id
-    )
+    safe_message("Loading parent count ID: ", count_id)
 
     tryCatch(
       {parent <- load_wang_parent(
@@ -461,8 +658,7 @@ run_wang_full_cohort <- function(config = CONFIG) {
               )
             }
           )
-
-          append_status(one_status, status_file)
+          append_status(one_status, status_file, run_id = config$run_id)
         }
 
         rm(parent)
@@ -498,7 +694,8 @@ run_wang_full_cohort <- function(config = CONFIG) {
               error = paste0("Parent-level error: ",conditionMessage(e)),
               stringsAsFactors = FALSE
             ),
-            status_file
+            status_file,
+            run_id = config$run_id
           )
         }
       }
@@ -506,57 +703,138 @@ run_wang_full_cohort <- function(config = CONFIG) {
   }
 
   status_all <- data.table::fread(status_file)
-
+  
+  if (!all(c("run_id", "success") %in% names(status_all)) ||
+      anyNA(status_all$success) ||
+      !all(status_all$run_id %in% config$run_id)) {
+    stop("Status records contain a different run_id.")
+  }
+  
   status_latest <- status_all[, .SD[.N], by = subarray_id]
-
+  expected_ids <- rownames(ids)[as.character(ids$id) %in% parent_ids]
+  
+  if (!setequal(status_latest$subarray_id, expected_ids)) {
+    stop(
+      "Status records do not cover exactly ",
+      "the selected subarrays."
+    )
+  }
+  
   data.table::fwrite(
     status_latest,
-    file.path(config$output_dir, "status",
+    file.path(
+      config$output_dir,
+      "status",
       "subarray_processing_status_latest.csv"
     )
   )
-
-  qc_files <- list.files(
-    file.path(config$output_dir, "qc_summaries"),
-    pattern = "_qc\\.csv$",
-    full.names = TRUE
-  )
-
-  if (length(qc_files) > 0) {
-    qc_all <- data.table::rbindlist(
-      lapply(qc_files, data.table::fread),
-      fill = TRUE
-    )
-
-    data.table::setorder(qc_all, subarray_id)
-
-    data.table::fwrite(
-      qc_all,
-      file.path(config$output_dir, "cohort_qc_summary.csv")
-    )
+  
+  good_ids <- status_latest[success %in% TRUE, subarray_id]
+  if (!length(good_ids)) {
+    stop("No subarrays completed successfully.")
   }
-
-  coverage_files <- list.files(
-    file.path(config$output_dir, "module_coverage"),
-    pattern = "_module_coverage\\.csv$",
-    full.names = TRUE
+  
+  read_current_summary <- function(path, sid) {
+    x <- data.table::fread(path)
+    
+    if (!all(c("run_id", "subarray_id") %in% names(x)) ||
+    !nrow(x) ||
+    !all(x$run_id %in% config$run_id) ||
+    !identical(unique(as.character(x$subarray_id)), sid)) {
+      stop(
+        "Summary does not belong to the ",
+        "current array/run: ", path
+      )
+    }
+    x
+  }
+  
+  qc_all <- data.table::rbindlist(Map(
+    read_current_summary,
+    file.path(config$output_dir, "qc_summaries", paste0(good_ids, "_qc.csv")),
+    good_ids
+  ))
+  
+  coverage_all <- data.table::rbindlist(Map(
+    read_current_summary,
+    file.path(config$output_dir, "module_coverage", paste0(good_ids, "_module_coverage.csv")),
+    good_ids
+  ))
+  
+  if (nrow(qc_all) != length(good_ids) ||
+      anyDuplicated(qc_all$subarray_id) ||
+      nrow(coverage_all) !=
+      length(good_ids) * length(GENE_SETS) ||
+      anyDuplicated(
+        coverage_all[, .(subarray_id, module)]
+      )) {
+    stop("Duplicate or incomplete QC/module-summary records.")
+  }
+  
+  data.table::setorder(qc_all, subarray_id)
+  data.table::setorder(coverage_all, subarray_id, module)
+  
+  data.table::fwrite(
+    qc_all,
+    file.path(config$output_dir, "cohort_qc_summary.csv")
   )
-
-  if (length(coverage_files) > 0) {
-    coverage_all <-
-      data.table::rbindlist(
-        lapply(coverage_files, data.table::fread),
-        fill = TRUE
-      )
-
-    data.table::setorder(coverage_all, subarray_id, module)
-
-    data.table::fwrite(
-      coverage_all,
-      file.path(
-        config$output_dir,
-        "cohort_module_coverage.csv"
-      )
+  
+  data.table::fwrite(
+    coverage_all,
+    file.path(
+      config$output_dir,
+      "cohort_module_coverage.csv"
+    )
+  )
+  
+  # Accept only the already-audited empty array and matching error.
+  expected_empty <- status_latest[
+    success %in% FALSE &
+      subarray_id == "CN17_E2" &
+      !is.na(error) &
+      grepl(
+        "No spots found for subarray: CN17_E2",
+        error,
+        fixed = TRUE
+      ),
+    subarray_id
+  ]
+  
+  unexpected <- status_latest[success %in% FALSE &!subarray_id %in% expected_empty]
+  
+  full_run <- setequal(parent_ids, unique(as.character(ids$id)))
+  
+  accounting_ok <- !full_run || (
+    nrow(status_latest) == 281L &&
+      nrow(qc_all) == 280L &&
+      sum(qc_all$n_spots) == 270310L &&
+      data.table::uniqueN(qc_all$subject_id) == 92L
+  )
+  
+  run_complete <- nrow(unexpected) == 0L && accounting_ok
+  
+  data.table::fwrite(
+    data.frame(
+      run_id = config$run_id,
+      run_status = if (run_complete) {"complete"} else {"failed"},
+      full_cohort = full_run,
+      n_successful = length(good_ids),
+      n_expected_empty = length(expected_empty),
+      n_unexpected_failures = nrow(unexpected),
+      n_spots = sum(qc_all$n_spots),
+      accounting_ok = accounting_ok
+    ),
+    file.path(
+      config$output_dir,
+      "logs",
+      "processing_run_summary.csv"
+    )
+  )
+  
+  if (!run_complete) {
+    stop(
+      "Run failed acceptance checks; inspect ",
+      "the status and run-summary files."
     )
   }
 

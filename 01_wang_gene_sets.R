@@ -64,3 +64,7 @@ GENE_SETS <- list(
     "RASGRP2", "TCF7", "RIPOR2", "RAC2", "IL16", "CCR7", "CD52", "TCL1A", "ATP2A3"
   )
 )
+
+GENE_ALIASES <- c(
+  NIBAN3 = "FAM129C", RIPOR2 = "FAM65B", CXCR7  = "ACKR3"
+)
